@@ -17,14 +17,14 @@ static const unsigned char PROGMEM Crc8Table[256] = {
 	202, 148, 118, 40, 171, 245, 23, 73, 8, 86, 180, 234, 105, 55, 213, 139,
 	87, 9, 235, 181, 54, 104, 138, 212, 149, 203, 41, 119, 244, 170, 72, 22,
 	233, 183, 85, 11, 136, 214, 52, 106, 43, 117, 151, 201, 74, 20, 246, 168,
-	116, 42, 200, 150, 21, 75, 169, 247, 182, 232, 10, 84, 215, 137, 107, 53
-};
+	116, 42, 200, 150, 21, 75, 169, 247, 182, 232, 10, 84, 215, 137, 107, 53};
 
-unsigned char Crc8(unsigned char *pcBlock, unsigned char len) {
+unsigned char Crc8(unsigned char *pcBlock, unsigned char len)
+{
 	unsigned char crc = 0x00;
-	while (len--) {
+	while (len--)
+	{
 		crc = pgm_read_byte(Crc8Table + (crc ^ *pcBlock++));
 	}
 	return crc;
 }
-
