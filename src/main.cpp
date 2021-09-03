@@ -1,21 +1,12 @@
-#include <Arduino.h>
+#include <stddef.h>
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <avr/sleep.h>
+#include <util/delay.h>
 #include "crc8.h"
-#include "avr/sleep.h"
-#include "avr/eeprom.h"
-#include "util/delay.h"
-
-#define EEPROM_DATA_LENGTH 128
+#include "rom.h"
 
 static const uint8_t ow_address[8] PROGMEM = {0x09, 0x52, 0x8D, 0xED, 0x65, 0x00, 0x00, 0xEF};
-static const uint8_t default_eeprom_data[EEPROM_DATA_LENGTH] PROGMEM = {
-    'D', 'E', 'L', 'L', '0', '0', 'A', 'C', '0', '4', '5', '1', '9', '5', '0', '2',
-    '3', 'C', 'N', '0', 'C', 'D', 'F', '5', '7', '7', '2', '4', '3', '8', '6', '5',
-    'Q', '2', '7', 'F', '2', 'A', '0', '5', '=', 0x94, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 enum
 {
@@ -69,98 +60,6 @@ static struct
     DDRB |= _BV(PB2);   \
   } while (0)
 
-ISR(INT0_vect)
-{
-  uint8_t bit = ow.bit_state;
-  do
-  {
-    GIFR = _BV(INTF0);
-    bit = !bit;
-    if (!bit && ow.pull_low_next)
-    {
-      OW_PULL_LOW();
-      ow.pull_low_next = 0;
-    }
-    ow_bit_change(bit);
-  } while (GIFR & _BV(INTF0));
-  ow.bit_state = (PINB & _BV(PB2)) ? 1 : 0;
-}
-
-ISR(TIMER0_OVF_vect)
-{
-  TCCR0B = 0;
-  TIFR = _BV(OCF0A);
-  if (!ow.bit_state)
-  {
-    ow.state = OW_STATE_RESET;
-    ow.selected = 0;
-  }
-}
-
-ISR(TIMER0_COMPA_vect)
-{
-  switch (ow.state)
-  {
-  case OW_STATE_PRESENCE:
-    OW_RELEASE();
-    ow_rx(&ow.command, sizeof(ow.command), ow_command_received);
-    break;
-  }
-}
-
-void setup()
-{
-  // Disable analog comparator
-  ACSR |= _BV(ACD);
-
-  // Disable ADC, TIM1 and USI
-  PRR |= _BV(PRADC) | _BV(PRUSI) | _BV(PRTIM1);
-
-  // All pins: Input pullup
-  DDRB = 0;
-  PORTB = 0xFF;
-
-  // Check EEPROM and load default values if needed
-  OW_PULL_LOW();
-  if (eeprom_read_byte((const uint8_t *)0) == 0xFF)
-  {
-    for (uint8_t i = 0; i < EEPROM_DATA_LENGTH; i++)
-    {
-      eeprom_write_byte(((uint8_t *)0) + i, pgm_read_byte(default_eeprom_data + i));
-    }
-  }
-  else
-  {
-    _delay_us(10);
-  }
-  OW_RELEASE();
-
-  // TIM0: overflow and compare A interrupts
-  TIMSK |= _BV(TOIE0) | _BV(OCIE0A);
-  OCR0A = 0;
-
-  // INT0: Any change
-  MCUCR = (MCUCR | _BV(ISC00)) & ~_BV(ISC01);
-  GIMSK |= _BV(INT0);
-
-  // Read current line state
-  GIFR = _BV(INTF0);
-  ow.bit_state = (PINB & _BV(PB2)) ? 1 : 0;
-
-  // Enable interrupts
-  sei();
-}
-
-void loop()
-{
-  set_sleep_mode(SLEEP_MODE_IDLE);
-  while (1)
-  {
-    sleep_bod_disable();
-    sleep_mode();
-  }
-}
-
 static inline void ow_start_timer(void)
 {
   TCNT0 = 0;
@@ -195,7 +94,7 @@ static inline void ow_fetch_current_byte_from_buffer()
     ow.current_value = pgm_read_byte(ow.tx_buffer + ow.current_byte);
     break;
   case OW_DATA_SOURCE_EEPROM:
-    ow.current_value = eeprom_read_byte(ow.tx_buffer + ow.current_byte);
+    ow.current_value = rom_read_byte(ow.tx_buffer + ow.current_byte);
     break;
   }
 }
@@ -228,21 +127,6 @@ static void ow_read_mem(void)
   ow_tx(ow.arg_buffer + 2, 1, OW_DATA_SOURCE_RAM, ow_read_real_mem);
 }
 
-static void ow_write_real_mem(void)
-{
-  uint16_t offset = (((uint16_t)ow.arg_buffer[1]) << 8) | ow.arg_buffer[0];
-  uint8_t data = ow.arg_buffer[2];
-  uint8_t *base = (uint8_t *)offset;
-  eeprom_write_byte(base, data);
-}
-
-static void ow_write_mem(void)
-{
-  uint8_t tmp[] = {ow.command, ow.arg_buffer[0], ow.arg_buffer[1], ow.arg_buffer[2]};
-  ow.arg_buffer[3] = Crc8(tmp, sizeof(tmp));
-  ow_tx(ow.arg_buffer + 2, 1, OW_DATA_SOURCE_RAM, ow_write_real_mem);
-}
-
 static void ow_command_received(void)
 {
   switch (ow.command)
@@ -260,11 +144,6 @@ static void ow_command_received(void)
       ow_rx(ow.arg_buffer, 2, ow_read_mem);
     }
     break;
-  case 0x0F: // WRITE MEM
-    if (ow.selected)
-    {
-      ow_rx(ow.arg_buffer, 3, ow_write_mem);
-    }
   }
 }
 
@@ -357,5 +236,85 @@ static void ow_bit_change(uint8_t bit)
   else
   {
     _delay_us(10);
+  }
+}
+
+ISR(INT0_vect)
+{
+  uint8_t bit = ow.bit_state;
+  do
+  {
+    GIFR = _BV(INTF0);
+    bit = !bit;
+    if (!bit && ow.pull_low_next)
+    {
+      OW_PULL_LOW();
+      ow.pull_low_next = 0;
+    }
+    ow_bit_change(bit);
+  } while (GIFR & _BV(INTF0));
+  ow.bit_state = (PINB & _BV(PB2)) ? 1 : 0;
+}
+
+ISR(TIMER0_OVF_vect)
+{
+  TCCR0B = 0;
+  TIFR = _BV(OCF0A);
+  if (!ow.bit_state)
+  {
+    ow.state = OW_STATE_RESET;
+    ow.selected = 0;
+  }
+}
+
+ISR(TIMER0_COMPA_vect)
+{
+  switch (ow.state)
+  {
+  case OW_STATE_PRESENCE:
+    OW_RELEASE();
+    ow_rx(&ow.command, sizeof(ow.command), ow_command_received);
+    break;
+  }
+}
+
+int main()
+{
+  // Disable analog comparator
+  ACSR |= _BV(ACD);
+
+  // Disable ADC, TIM1 and USI
+  PRR |= _BV(PRADC) | _BV(PRUSI) | _BV(PRTIM1);
+
+  // All pins: Input pullup
+  DDRB = 0;
+  PORTB = 0xFF;
+
+  // Check EEPROM and load default values if needed
+  OW_PULL_LOW();
+  _delay_us(10);
+  OW_RELEASE();
+
+  // TIM0: overflow and compare A interrupts
+  TIMSK |= _BV(TOIE0) | _BV(OCIE0A);
+  OCR0A = 0;
+
+  // INT0: Any change
+  MCUCR = (MCUCR | _BV(ISC00)) & ~_BV(ISC01);
+  GIMSK |= _BV(INT0);
+
+  // Read current line state
+  GIFR = _BV(INTF0);
+  ow.bit_state = (PINB & _BV(PB2)) ? 1 : 0;
+
+  // Enable interrupts
+  sei();
+
+  // main loop
+  set_sleep_mode(SLEEP_MODE_IDLE);
+  while (1)
+  {
+    sleep_bod_disable();
+    sleep_mode();
   }
 }
