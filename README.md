@@ -1,3 +1,5 @@
+❗ this is currently untested / probably broken. Fell free to fix it tho :P ❗
+
 # 🔌 Dell Charger Emulator 
 
 Make your ATTiny85 emulate a original dell charger.
